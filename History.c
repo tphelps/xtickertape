@@ -1273,6 +1273,7 @@ process_events(Widget widget, XtPointer closure, XEvent *event,
                 *continue_to_dispatch = False;
                 return;
             }
+            break;
 
         case NoExpose:
             /* Stop drawing if the widget is obscured. */
