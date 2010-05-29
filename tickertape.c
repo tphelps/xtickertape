@@ -437,6 +437,31 @@ open_config_file(tickertape_t self, const char *filename, const char *template)
     return fd;
 }
 
+struct groups_data {
+    tickertape_t tickertape;
+    group_sub_t *groups;
+    int groups_count;
+};
+
+static void
+free_groups(group_sub_t* groups, int groups_count)
+{
+    int index;
+
+    /* If no groups were allocated then we're done. */
+    if (groups == NULL) {
+        return;
+    }
+
+    /* Free each individual group. */
+    for (index = 0; index < groups_count; index++) {
+        group_sub_free(groups[index]);
+    }
+
+    /* Free the table itself. */
+    free(groups);
+}
+
 /* The callback for the groups file parser */
 static int
 parse_groups_callback(void *rock,
@@ -448,7 +473,8 @@ parse_groups_callback(void *rock,
                       char *const *key_names,
                       int key_count)
 {
-    tickertape_t self = (tickertape_t)rock;
+    struct groups_data *self = (struct groups_data *)rock;
+    tickertape_t tickertape = self->tickertape;
     size_t length;
     char *expression;
     group_sub_t subscription;
@@ -459,15 +485,14 @@ parse_groups_callback(void *rock,
     if (expression == NULL) {
         return -1;
     }
-
     snprintf(expression, length, GROUP_SUB, name, name);
 
     /* Allocate us a subscription */
     subscription = group_sub_alloc(name, expression,
                                    in_menu, has_nazi,
                                    min_time * 60, max_time * 60,
-                                   self->keys, key_names, key_count,
-                                   receive_callback, self);
+                                   tickertape->keys, key_names, key_count,
+                                   receive_callback, tickertape);
     if (subscription == NULL) {
         return -1;
     }
@@ -484,14 +509,20 @@ parse_groups_callback(void *rock,
 
 /* Parse the groups file and update the groups table accordingly */
 static int
-parse_groups_file(tickertape_t self)
+parse_groups_file(tickertape_t self,
+                  group_sub_t **groups_out,
+                  int* groups_count_out)
 {
+    struct groups_data context;
     const char *filename = tickertape_groups_filename(self);
     groups_parser_t parser;
-    int fd;
+    int fd, res;
 
     /* Allocate a new groups file parser */
-    parser = groups_parser_alloc(parse_groups_callback, self, filename);
+    context.tickertape = self;
+    context.groups = NULL;
+    context.groups_count = 0;
+    parser = groups_parser_alloc(parse_groups_callback, &context, filename);
     if (parser == NULL) {
         return -1;
     }
@@ -511,25 +542,38 @@ parse_groups_file(tickertape_t self)
         /* Read from the file */
         length = read(fd, buffer, BUFFER_SIZE);
         if (length < 0) {
-            close(fd);
-            groups_parser_free(parser);
-            return -1;
+            res = -1;
+            break;
         }
 
         /* Send it to the parser */
         if (groups_parser_parse(parser, buffer, length) < 0) {
-            close(fd);
-            groups_parser_free(parser);
-            return -1;
+            res = -1;
+            break;
         }
 
         /* Watch for end-of-file */
         if (length == 0) {
-            close(fd);
-            groups_parser_free(parser);
-            return 0;
+            res = 0;
+            break;
         }
     }
+
+    /* Clean up */
+    close(fd);
+    groups_parser_free(parser);
+
+    /* If we failed to parse the whole file then clean up the groups
+     * we did manage to read. */
+    if (res < 0) {
+        free_groups(context.groups, context.groups_count);
+        return -1;
+    }
+
+    /* Return the result. */
+    *groups_out = context.groups;
+    *groups_count_out = context.groups_count;
+    return 0;
 }
 
 /* The callback for the usenet file parser */
@@ -706,51 +750,40 @@ find_group(group_sub_t *groups, int count, const char *expression)
 static void
 reload_groups(tickertape_t self, key_table_t old_keys, key_table_t new_keys)
 {
-    group_sub_t *old_groups = self->groups;
-    int old_count = self->groups_count;
+    group_sub_t *new_groups;
+    int new_count;
     int index;
     int count;
 
-    self->groups = NULL;
-    self->groups_count = 0;
-
     /* Read the new-and-improved groups file */
-    if (parse_groups_file(self) < 0) {
-        /* Clean up the mess */
-        for (index = 0; index < self->groups_count; index++) {
-            group_sub_free(self->groups[index]);
-        }
-
-        /* Put the old groups back into place */
-        self->groups = old_groups;
-        self->groups_count = old_count;
+    if (parse_groups_file(self, &new_groups, &new_count) < 0) {
         return;
     }
 
     /* Reuse elvin subscriptions whenever possible */
-    for (index = 0; index < self->groups_count; index++) {
-        group_sub_t group = self->groups[index];
+    for (index = 0; index < new_count; index++) {
+        group_sub_t new_group = new_groups[index];
         int old_index;
 
         /* Look for a match */
-        old_index = find_group(old_groups, old_count,
-                               group_sub_expression(group));
+        old_index = find_group(self->groups, self->groups_count,
+                               group_sub_expression(new_group));
         if (old_index < 0) {
             /* None found.  Set the subscription's connection */
-            group_sub_set_connection(group, self->handle, self->error);
+            group_sub_set_connection(new_group, self->handle, self->error);
         } else {
-            group_sub_t old_group = old_groups[old_index];
+            group_sub_t old_group = self->groups[old_index];
 
-            group_sub_update_from_sub(old_group, group, old_keys, new_keys);
-            group_sub_free(group);
-            self->groups[index] = old_group;
-            old_groups[old_index] = NULL;
+            group_sub_update_from_sub(old_group, new_group, old_keys, new_keys);
+            group_sub_free(new_group);
+            new_groups[index] = old_group;
+            self->groups[old_index] = NULL;
         }
     }
 
     /* Free the remaining old subscriptions */
-    for (index = 0; index < old_count; index++) {
-        group_sub_t old_group = old_groups[index];
+    for (index = 0; index < self->groups_count; index++) {
+        group_sub_t old_group = self->groups[index];
 
         if (old_group != NULL) {
             group_sub_set_connection(old_group, NULL, self->error);
@@ -760,7 +793,11 @@ reload_groups(tickertape_t self, key_table_t old_keys, key_table_t new_keys)
     }
 
     /* Release the old array */
-    free(old_groups);
+    free(self->groups);
+
+    /* Swap in the new groups. */
+    self->groups = new_groups;
+    self->groups_count = new_count;
 
     /* Renumber the items in the control panel */
     count = 0;
@@ -1291,7 +1328,7 @@ tickertape_alloc(XTickertapeRec *resources,
     }
 
     /* Read the subscriptions from the groups file */
-    if (parse_groups_file(self) < 0) {
+    if (parse_groups_file(self, &self->groups, &self->groups_count) < 0) {
         exit(1);
     }
 
