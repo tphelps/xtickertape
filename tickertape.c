@@ -1416,7 +1416,7 @@ tickertape_free(tickertape_t self)
 }
 
 /* Answers the tickertape's user name */
-const const char *
+const char *
 tickertape_user_name(tickertape_t self)
 {
     return self->user;
