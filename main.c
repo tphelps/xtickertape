@@ -274,7 +274,7 @@ static XtActionsRec actions[] =
 
 /* Returns the name of the user who started this program */
 static const char *
-get_user()
+get_user(void)
 {
     const char *user;
 
@@ -296,7 +296,7 @@ get_user()
 
 /* Looks up the domain name of the host */
 static const char *
-get_domain()
+get_domain(void)
 {
     const char *domain;
 #ifdef HAVE_UNAME
