@@ -211,7 +211,7 @@ notify_cb(elvin_handle_t handle,
     }
 
     /* Get the folder field */
-    if (!elvin_notification_get_string(notification, F_FOLDER, NULL, &value,
+    if (!elvin_notification_get_string(notification, F_FOLDER, &found, &value,
                                        error)) {
         eeprintf(error, "elvin_notification_get_string failed\n");
         exit(1);
