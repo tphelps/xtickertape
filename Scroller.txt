@@ -1,0 +1,34 @@
+The Scroller records both ends of a doubly-linked list of
+glyph_holders.  These represent the messages currently visible in the
+scroller.
+
+The glyph_holders, in turn, hold pointers to glyphs.  The glyphs
+comprise a doubly-linked, circular queue corresponding to the messages
+to display in the scroller.  Glyphs are removed from this queue when
+they expire unless they're still visible.  The glyph queue is never
+empty; it always contains at least the gap.
+
+
+      +-----------------------Scroller--------------------+
+      |                                                   |
+ [left_holder]                                       [right_holder]
+      |							  |
+      v							  v
+  glyph_holder <-> glyph_holder <-> glyph_holder <-> glyph_holder
+      |		       	|                |                |
+      v	       		v  		 v  		  v
+    glyph      +----->glyph<---------->glyph<---------->glyph<--+
+      ^        |                                                |
+      |	       |						|
+      v	       |						|
+ +->glyph<-----+						|
+ |								|
+ +--------------------------------------------------------------+
+
+If a glyph is replaced by a more recent version of a message, it is
+linked to the original message in a predecessor/successor
+doubly-linked list.  The ultimate successor must remain in the
+circular queue while one of its predecessors is visible.  This list
+need only contain visible glyphs and the ultimate successor; there can
+be two visible glyphs and one successor, so the maximum length should
+never exceed three.
