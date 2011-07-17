@@ -194,6 +194,9 @@ struct glyph {
     /* The next glyph in the circular queue */
     glyph_t next;
 
+    /* The glyph superseded by this one.  See successor below. */
+    glyph_t predecessor;
+
     /* The glyph which supersedes this one.  When a replacement glyph
      * arrives. we substitute it for its replacement in the circular
      * queue.  In order to find the old glyph's next or previous
@@ -213,8 +216,8 @@ struct glyph {
     short ref_count;
 #endif /* DEBUG_GLYPH */
 
-    /* The number of glyph_holders pointing to this glyph */
-    short visible_count;
+    /* The number of glyph_holders pointing to this glyph; at most two */
+    short holder_count;
 
     /* The glyph's message_view or NULL if this is the gap */
     message_view_t message_view;
@@ -324,7 +327,7 @@ glyph_free(glyph_t self)
 #else /* !DEBUG_GLYPH */
     ASSERT(self->ref_count == 0);
 #endif /* DEBUG_GLYPH */
-    ASSERT(self->visible_count == 0);
+    ASSERT(self->holder_count == 0);
 
     /* If the glyph has a successor then release our reference to it. */
     if (self->successor) {
@@ -465,6 +468,22 @@ glyph_get_width(glyph_t self)
            MIN(self->sizes.lbearing, 0);
 }
 
+/* Returns non-zero if one of the glyph's predecessors is visible. */
+static int
+glyph_has_visible_predecessor(glyph_t self)
+{
+    glyph_t predecessor = self->predecessor;
+    while (predecessor != NULL) {
+        if (predecessor->holder_count != 0) {
+            return 1;
+        }
+
+        predecessor = predecessor->predecessor;
+    }
+
+    return 0;
+}
+
 /* Returns the glyph which supersedes this one */
 static glyph_t
 glyph_get_successor(glyph_t self)
@@ -481,8 +500,10 @@ glyph_get_successor(glyph_t self)
 static void
 glyph_set_successor(glyph_t self, glyph_t successor)
 {
-    /* This should only be called when the glyph is visible. */
-    ASSERT(self->visible_count != 0);
+    /* This should only be called when the glyph is visible.
+     * Otherwise the successor would just be substituted for the
+     * original glyph. */
+    ASSERT(self->holder_count != 0 || glyph_has_visible_predecessor(self));
 
     /* The linked list of successors should never contain more than
      * three elements.  We can end up with three glyphs when the
@@ -492,24 +513,31 @@ glyph_set_successor(glyph_t self, glyph_t successor)
      * forms of this case.
      *
      * This function can be called with either of the visible glyphs,
-     * but we're only interested in the one which points to the
-     * invisible glyph, so if this glyph's successor is visible, use
-     * that instead. */
-    if (self->successor != NULL && self->successor->visible_count != 0) {
+     * but we're only interested in the one which points to the glyph
+     * that lacks a holder, not visible in the scroller, so if this
+     * glyph's successor has a holder then use that instead. */
+    if (self->successor != NULL && self->successor->holder_count != 0) {
+        ASSERT(self->successor->predecessor == self);
         self = self->successor;
     }
 
     /* See if this glyph has a successor already. */
     if (self->successor != NULL) {
-        ASSERT(self->successor->visible_count == 0);
+        /* Sanity check the successor's linked list. */
+        ASSERT(self->successor->predecessor == self);
 
-        /* Discard the replacement reference to the successor. */
+        /* The successor can't be visible. */
+        ASSERT(self->successor->holder_count == 0);
+
+        /* Discard the replacement reference to the old successor. */
         GLYPH_FREE_REF(self->successor, ref_replace, self);
+        self->successor->predecessor = NULL;
     }
 
     /* Allocate a replacement reference to the new successor. */
     GLYPH_ALLOC_REF(successor, ref_replace, self);
     self->successor = successor;
+    successor->predecessor = self;
 }
 
 /* Deletes a glyph */
@@ -694,7 +722,13 @@ glyph_holder_alloc(glyph_t glyph, int width)
     /* Record the glyph and tell it that it's visible */
     self->glyph = glyph;
     GLYPH_ALLOC_REF(glyph, ref_holder, self);
-    glyph->visible_count++;
+    glyph->holder_count++;
+    ASSERT(glyph->holder_count <= 2);
+
+    /* The glyph should have no successor; we would have allocated a
+     * holder for the successor otherwise. */
+    ASSERT(glyph->successor == NULL);
+
     return self;
 }
 
@@ -704,9 +738,29 @@ glyph_holder_free(glyph_holder_t self)
 {
     glyph_t glyph = self->glyph;
 
-    /* Dequeue the glyph if it's expired and invisible */
-    if (--glyph->visible_count == 0 && glyph->is_expired) {
-        queue_remove(glyph);
+    /* The glyph has one fewer holder. */
+    ASSERT(glyph->holder_count > 0);
+    glyph->holder_count--;
+
+    /* Update the predecessor/successor list if the glyph is no longer
+     * directly visible. */
+    if (glyph->holder_count == 0) {
+        if (glyph->predecessor != NULL) {
+            glyph->predecessor->successor = glyph->successor;
+        }
+
+        if (glyph->successor != NULL) {
+            glyph->successor->predecessor = glyph->predecessor;
+        }
+
+        /* If the glyph is expired then remove it from the queue
+         * unless its the ultimate successor of a glyph that's still
+         * visible. */
+        if (glyph->is_expired && 
+            (glyph->successor != NULL ||
+             !glyph_has_visible_predecessor(glyph))) {
+            queue_remove(glyph);
+        }
     }
 
     /* Lose our reference to the glyph */
@@ -2078,11 +2132,12 @@ delete_glyph(ScrollerWidget self, glyph_t glyph)
         return;
     }
 
-    /* If the glyph isn't visible then simply remove it from the
-     * queue. */
-    DPRINTF((1, "[delete_glyph %c]\n",
-             glyph->visible_count == 0 ? 'f' : 't'));
-    if (glyph->visible_count == 0) {
+    /* If the glyph and its antecedents aren't visible then simply
+     * remove it from the queue. */
+    DPRINTF((1, "[delete_glyph %c/%c]\n",
+             glyph->holder_count == 0 ? 'f' : 't',
+             glyph_has_visible_predecessor(glyph) ? 't' : 'f'));
+    if (glyph->holder_count == 0 && !glyph_has_visible_predecessor(glyph)) {
         queue_remove(glyph);
         return;
     }
@@ -2415,11 +2470,12 @@ ScPurgeKilled(Widget widget)
 void
 ScGlyphExpired(ScrollerWidget self, glyph_t glyph)
 {
-    DPRINTF((1, "[ScGlyphExpired %c]\n",
-             glyph->visible_count == 0 ? 'f' : 't'));
+    DPRINTF((1, "[ScGlyphExpired %c/%c]\n",
+             glyph->holder_count == 0 ? 'f' : 't',
+             glyph_has_visible_predecessor(glyph) ? 't' : 'f'));
 
     /* Dequeue the glyph if it's not visible */
-    if (glyph->visible_count == 0) {
+    if (glyph->holder_count == 0 && glyph_has_visible_predecessor(glyph)) {
         queue_remove(glyph);
     }
 }
