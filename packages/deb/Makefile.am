@@ -9,7 +9,7 @@ EXTRA_DIST = changelog.in control.in rules.in $(BUILT_SOURCES)
 deb: $(srcdir)/rules $(srcdir)/control $(srcdir)/changelog
 	ln -sf @top_srcdir@/COPYING copyright
 	ln -sf ./packages/deb @top_srcdir@/debian
-	(cd @top_srcdir@; $(MAKE) -f debian/rules binary)
+	(cd @top_srcdir@; fakeroot $(MAKE) -f debian/rules binary)
 
 edit = sed \
 	-e 's,@PACKAGE\@,$(PACKAGE),g' \
